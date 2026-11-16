@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Samsung Galaxy Tab S7 FE 5G (SM-T736B, board revision 7).
+ *
+ * First import: only what a boot needs. Every node that powers or drives
+ * board hardware (panel, backlight, touch, S Pen, charger, fuel gauge,
+ * amplifiers, keyboard cover, regulators, modem) is left out until it has
+ * been checked against the stock device tree. The one exception is the USB 2.0
+ * device port, which is the debug channel of the first boots: the three rails
+ * of its PHY and nothing else.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+
+#include "sm7225.dtsi"
+
+/ {
+	model = "Samsung Galaxy Tab S7 FE 5G";
+	compatible = "samsung,gts7xllite", "qcom,sm7225";
+	chassis-type = "tablet";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Messages go to the screen: the first boot has no USB or serial. */
+		bootargs = "rdinit=/init console=tty0 panic=0 clk_ignore_unused pd_ignore_unused";
+
+		fdt-handoff {
+			/*
+			 * Stock tree of the tablet at board revision 7, as captured from the
+			 * running device: the bootloader selects the board-id 05 overlay.
+			 */
+			stock-compatible = "qcom,lagoon-mtp", "qcom,lagoon", "qcom,mtp";
+			stock-model = "Samsung GTS7XLLITE PROJECT (board-id,05)";
+			keep-initrd;
+		};
+
+		/*
+		 * The bootloader's splash buffer, reserved by cont_splash_memory in
+		 * sm6350.dtsi. The panel is 1600x2560 natively. The pixel format is
+		 * not verified.
+		 */
+		framebuffer0: framebuffer@a0000000 {
+			compatible = "simple-framebuffer";
+			reg = <0 0xa0000000 0 (1600 * 2560 * 4)>;
+			width = <1600>;
+			height = <2560>;
+			stride = <(1600 * 4)>;
+			format = "a8r8g8b8";
+		};
+	};
+
+	/* The bootloader passes the real memory map; handoff replaces this. */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0 0x80000000 0 0>;
+	};
+};
+
+/*
+ * Rails of the USB 2.0 PHY only. The limits are the levels that Samsung's PHY
+ * driver requests (phy-msm-qusb-v2.c, QUSB2PHY_1P8_VOL_* and QUSB2PHY_3P3_VOL_*;
+ * lagoon-usb.dtsi, qusb@88e3000 qcom,vdd-voltage-level), inside the windows of
+ * the same rails in Samsung's lagoon-regulators.dtsi and in the Fairphone 4 tree,
+ * and equal to the voltages measured on the running tablet.
+ */
+&apps_rsc {
+	regulators-0 {
+		compatible = "qcom,pm6350-rpmh-regulators";
+		qcom,pmic-id = "a";
+
+		/* PHY 1.8 V: pm6350_l2, window 1.503-1.98 V; the PHY driver asks for 1.8 V. */
+		vreg_l2a: ldo2 {
+			regulator-name = "vreg_l2a";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* PHY 3.3 V: pm6350_l3, window 2.7-3.3 V; the PHY driver asks for 3.075-3.2 V. */
+		vreg_l3a: ldo3 {
+			regulator-name = "vreg_l3a";
+			regulator-min-microvolt = <3075000>;
+			regulator-max-microvolt = <3200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* PHY core: pm6350_l18, window 0.788-1.049 V; lagoon-usb.dtsi asks for 0.88 V. */
+		vreg_l18a: ldo18 {
+			regulator-name = "vreg_l18a";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <880000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+/* Debug channel: a USB 2.0 serial gadget. No SuperSpeed PHY, no Type-C controller yet. */
+&usb_1 {
+	status = "okay";
+};
+
+&usb_1_dwc3 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
+	/delete-property/ usb-role-switch;
+};
+
+&usb_1_hsphy {
+	vdd-supply = <&vreg_l18a>;
+	vdda-pll-supply = <&vreg_l2a>;
+	vdda-phy-dpdm-supply = <&vreg_l3a>;
+
+	status = "okay";
+};
+
+/*
+ * The bus of the SM5714 charger block (0x49), MUIC (0x25) and fuel gauge (0x71):
+ * controller 984000.i2c, SDA/SCL on gpio27/gpio28 (function qup11, 2 mA, pull-up).
+ * Read-only use for now. Sources: the same controller and pins in Samsung's
+ * lagoon-qupv3.dtsi (qupv3_se7_i2c, L253) and lagoon-pinctrl.dtsi (L467-480), in the
+ * tree that the bootloader passed on the running tablet (pinctrl-0 = qupv3_se7_i2c_active)
+ * and in the mainline i2c7 / qup_i2c7_default nodes of sm6350.dtsi. The bus runs at
+ * the default 100 kHz; Samsung uses 400 kHz.
+ */
+&gpi_dma1 {
+	status = "okay";
+};
+
+&qupv3_id_1 {
+	status = "okay";
+};
+
+&i2c7 {
+	status = "okay";
+};
