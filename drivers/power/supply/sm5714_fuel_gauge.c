@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Silicon Mitus SM5714 fuel gauge, read only.
+ * Silicon Mitus SM5714 fuel gauge (read only) and charger status.
  *
  * The gauge runs on the battery and keeps the battery model the vendor
  * firmware loaded into it across reboots. This driver only reads it: the
  * state of charge, voltage, current and temperature words of its SRAM, and
  * the status of the SM5714 charger block next to it. The one write is the
- * SRAM read address. No battery table, limit, reset or charger setting is
- * ever written; the charger keeps its power-on behaviour.
+ * SRAM read address. No battery table or reset is ever written.
+ *
+ * The one charger setting: on a wall charger (BC1.2 DCP or CDP, as the
+ * chip's MUIC detects it) inside 10-45 C, the input limit goes from the
+ * power-on 500 mA to 1500 mA and the charge current from 500 mA to 1000 mA
+ * (record/charging-design.md section 7, approved 2026-11-17). Anything else,
+ * a computer port included, keeps the power-on 500/500 mA. Float voltage,
+ * termination, watchdog and every other register keep their power-on values.
  *
  * Register map and conversions as in Samsung's sm5714_fuelgauge.c and
  * sm5714_charger.c (Galaxy Tab S7 FE kernel source).
@@ -42,6 +48,23 @@
 #define SM5714_CHG_BAT_ABSENT		BIT(2)
 #define SM5714_CHG_CHARGING		BIT(3)
 #define SM5714_CHG_TOPOFF		BIT(5)
+#define SM5714_CHG_VBUSCNTL		0x15	/* [6:0] input limit, 100 mA + 25 mA/step */
+#define SM5714_CHG_VBUS_LIMIT		GENMASK(6, 0)
+#define SM5714_CHG_CHGCNTL2		0x18	/* fast charge, 109.375 mA + 15.625 mA/(step - 7) */
+#define SM5714_CHG_IN_SLOW		0x10	/* 500 mA, the power-on value */
+#define SM5714_CHG_IN_FAST		0x38	/* 1500 mA */
+#define SM5714_CHG_CUR_SLOW		0x20	/* 500 mA, the power-on value */
+#define SM5714_CHG_CUR_FAST		0x40	/* 1000 mA */
+
+#define SM5714_MUIC_ADDR		0x25
+#define SM5714_MUIC_DEVICETYPE1		0x07
+#define SM5714_MUIC_DCP			BIT(2)
+#define SM5714_MUIC_CDP			BIT(3)
+
+/* Battery temperature window for the faster rate, in 0.1 C. */
+#define SM5714_FAST_TEMP_MIN		100
+#define SM5714_FAST_TEMP_MAX		450
+#define SM5714_FAST_TEMP_RESUME		400
 
 /* The charger's interrupt registers clear on read and are left alone: plug events come from polling STATUS1. */
 #define SM5714_CHG_POLL			msecs_to_jiffies(2000)
@@ -49,11 +72,14 @@
 struct sm5714_fg {
 	struct i2c_client *client;
 	struct i2c_client *chg;
+	struct i2c_client *muic;
 	struct mutex lock;	/* the SRAM address and data reads are one transaction */
 	struct power_supply *bat;
 	struct power_supply *usb;
 	struct delayed_work poll;
 	int online;
+	bool fast;
+	bool broken;	/* a read-back did not match: stay at the power-on values */
 };
 
 static int sm5714_fg_sram(struct sm5714_fg *fg, u8 addr)
@@ -67,6 +93,20 @@ static int sm5714_fg_sram(struct sm5714_fg *fg, u8 addr)
 	mutex_unlock(&fg->lock);
 
 	return ret;
+}
+
+static int sm5714_fg_signed(int raw, int mag);
+
+/* Battery temperature from the gauge's sensor, in 0.1 C. */
+static int sm5714_fg_temp(struct sm5714_fg *fg, int *val)
+{
+	int raw = sm5714_fg_sram(fg, SM5714_FG_SRAM_TEMPERATURE);
+
+	if (raw < 0)
+		return raw;
+	/* 0.1 degC = (raw & 0x7fff) * 10 * 2989 >> 19 */
+	*val = sm5714_fg_signed(raw, ((raw & 0x7fff) * 10 * 2989) >> 19);
+	return 0;
 }
 
 /* Sign and magnitude: bit 15 is the sign. */
@@ -176,12 +216,7 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CURRENT_AVG:
 		return sm5714_fg_current_ua(fg, SM5714_FG_SRAM_CURRENT_AVG, &val->intval);
 	case POWER_SUPPLY_PROP_TEMP:
-		raw = sm5714_fg_sram(fg, SM5714_FG_SRAM_TEMPERATURE);
-		if (raw < 0)
-			return raw;
-		/* 0.1 degC = (raw & 0x7fff) * 10 * 2989 >> 19 */
-		val->intval = sm5714_fg_signed(raw, ((raw & 0x7fff) * 10 * 2989) >> 19);
-		return 0;
+		return sm5714_fg_temp(fg, &val->intval);
 	default:
 		return -EINVAL;
 	}
@@ -237,15 +272,77 @@ static const struct power_supply_desc sm5714_usb_desc = {
 	.get_property = sm5714_usb_get_property,
 };
 
+/* Writes the two current settings and reads them back. Only these two registers are ever written. */
+static int sm5714_chg_set_rate(struct sm5714_fg *fg, bool fast)
+{
+	u8 in = fast ? SM5714_CHG_IN_FAST : SM5714_CHG_IN_SLOW;
+	u8 cur = fast ? SM5714_CHG_CUR_FAST : SM5714_CHG_CUR_SLOW;
+	int vbus, ret;
+
+	vbus = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_VBUSCNTL);
+	if (vbus < 0)
+		return vbus;
+	ret = i2c_smbus_write_byte_data(fg->chg, SM5714_CHG_VBUSCNTL,
+					(vbus & ~SM5714_CHG_VBUS_LIMIT) | in);
+	if (!ret)
+		ret = i2c_smbus_write_byte_data(fg->chg, SM5714_CHG_CHGCNTL2, cur);
+	if (ret)
+		return ret;
+
+	vbus = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_VBUSCNTL);
+	ret = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_CHGCNTL2);
+	if (vbus < 0 || ret < 0)
+		return vbus < 0 ? vbus : ret;
+	if ((vbus & SM5714_CHG_VBUS_LIMIT) != in || ret != cur)
+		return -EIO;
+	return 0;
+}
+
+static void sm5714_chg_slow(void *data)
+{
+	sm5714_chg_set_rate(data, false);
+}
+
+/* The faster rate needs a wall charger and a battery inside the window (with hysteresis on the hot side). */
+static bool sm5714_chg_want_fast(struct sm5714_fg *fg)
+{
+	int dev1, temp;
+
+	if (!fg->online || fg->broken)
+		return false;
+	dev1 = i2c_smbus_read_byte_data(fg->muic, SM5714_MUIC_DEVICETYPE1);
+	if (dev1 < 0 || !(dev1 & (SM5714_MUIC_DCP | SM5714_MUIC_CDP)))
+		return false;
+	if (sm5714_fg_temp(fg, &temp))
+		return false;
+	return temp >= SM5714_FAST_TEMP_MIN &&
+	       temp < (fg->fast ? SM5714_FAST_TEMP_MAX : SM5714_FAST_TEMP_RESUME);
+}
+
 static void sm5714_fg_poll(struct work_struct *work)
 {
 	struct sm5714_fg *fg = container_of(work, struct sm5714_fg, poll.work);
 	int raw = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_STATUS1);
+	bool fast;
 
 	if (raw >= 0 && !!(raw & SM5714_CHG_VBUS_POK) != fg->online) {
 		fg->online = !!(raw & SM5714_CHG_VBUS_POK);
 		power_supply_changed(fg->usb);
 		power_supply_changed(fg->bat);
+	}
+
+	fast = sm5714_chg_want_fast(fg);
+	if (fast != fg->fast) {
+		if (sm5714_chg_set_rate(fg, fast)) {
+			dev_err(&fg->client->dev, "charge rate write not confirmed: back to 500 mA, no further writes\n");
+			fg->broken = true;
+			sm5714_chg_set_rate(fg, false);
+			fg->fast = false;
+		} else {
+			dev_info(&fg->client->dev, "charge rate: %s\n", fast ? "wall charger, 1500 mA in, 1000 mA charge"
+								  : "500 mA in, 500 mA charge");
+			fg->fast = fast;
+		}
 	}
 	schedule_delayed_work(&fg->poll, SM5714_CHG_POLL);
 }
@@ -265,6 +362,7 @@ static int sm5714_fg_probe(struct i2c_client *client)
 	if (!fg)
 		return -ENOMEM;
 	fg->client = client;
+	i2c_set_clientdata(client, fg);
 	ret = devm_mutex_init(dev, &fg->lock);
 	if (ret)
 		return ret;
@@ -293,6 +391,18 @@ static int sm5714_fg_probe(struct i2c_client *client)
 	if (IS_ERR(fg->usb))
 		return dev_err_probe(dev, PTR_ERR(fg->usb), "failed to register usb\n");
 
+	fg->muic = devm_i2c_new_dummy_device(dev, client->adapter, SM5714_MUIC_ADDR);
+	if (IS_ERR(fg->muic))
+		return dev_err_probe(dev, PTR_ERR(fg->muic), "muic block\n");
+
+	/* Start from the power-on rate; registered before the poll, so it runs after the poll is cancelled. */
+	ret = sm5714_chg_set_rate(fg, false);
+	if (ret)
+		return dev_err_probe(dev, ret, "charger does not take its power-on rate\n");
+	ret = devm_add_action_or_reset(dev, sm5714_chg_slow, fg);
+	if (ret)
+		return ret;
+
 	fg->online = -1;	/* the first poll announces the state */
 	ret = devm_delayed_work_autocancel(dev, &fg->poll, sm5714_fg_poll);
 	if (ret)
@@ -300,6 +410,14 @@ static int sm5714_fg_probe(struct i2c_client *client)
 	schedule_delayed_work(&fg->poll, 0);
 
 	return 0;
+}
+
+static void sm5714_fg_shutdown(struct i2c_client *client)
+{
+	struct sm5714_fg *fg = i2c_get_clientdata(client);
+
+	cancel_delayed_work_sync(&fg->poll);
+	sm5714_chg_set_rate(fg, false);
 }
 
 static const struct of_device_id sm5714_fg_of_match[] = {
@@ -314,8 +432,9 @@ static struct i2c_driver sm5714_fg_driver = {
 		.of_match_table = sm5714_fg_of_match,
 	},
 	.probe = sm5714_fg_probe,
+	.shutdown = sm5714_fg_shutdown,
 };
 module_i2c_driver(sm5714_fg_driver);
 
-MODULE_DESCRIPTION("Silicon Mitus SM5714 fuel gauge (read only)");
+MODULE_DESCRIPTION("Silicon Mitus SM5714 fuel gauge and charger status");
 MODULE_LICENSE("GPL");
