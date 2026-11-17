@@ -344,7 +344,8 @@ static void sm5714_fg_poll(struct work_struct *work)
 			fg->fast = fast;
 		}
 	}
-	schedule_delayed_work(&fg->poll, SM5714_CHG_POLL);
+	/* Freezable: the poll stops before the I2C controller suspends (s2idle timed out on 984000.i2c otherwise) */
+	queue_delayed_work(system_freezable_wq, &fg->poll, SM5714_CHG_POLL);
 }
 
 static char *sm5714_usb_supplied_to[] = { "battery" };
@@ -407,7 +408,7 @@ static int sm5714_fg_probe(struct i2c_client *client)
 	ret = devm_delayed_work_autocancel(dev, &fg->poll, sm5714_fg_poll);
 	if (ret)
 		return ret;
-	schedule_delayed_work(&fg->poll, 0);
+	queue_delayed_work(system_freezable_wq, &fg->poll, 0);
 
 	return 0;
 }

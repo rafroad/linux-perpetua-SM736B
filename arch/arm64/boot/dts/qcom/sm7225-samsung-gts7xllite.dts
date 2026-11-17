@@ -482,6 +482,28 @@
 };
 
 /*
+ * Real-time clock of the PMK8350, which sits at SPMI SID 6 on this tablet (stock qcom,pmk8350@6; mainline's
+ * pmk8350.dtsi assumes 0). Only the RTC: stock rtc@6100 (rtc 0x6100, alarm 0x6200, interrupt 0x62 0x1 rising).
+ * Read-only time as on every Qualcomm phone (no allow-set-time; Phonewave's rtc-offset keeps the offset in
+ * userspace); its alarm wakes the tablet from suspend. The PMIC's other blocks stay undescribed.
+ */
+&spmi_bus {
+	pmic@6 {
+		compatible = "qcom,pmk8350", "qcom,spmi-pmic";
+		reg = <0x6 SPMI_USID>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pmk8350_rtc: rtc@6100 {
+			compatible = "qcom,pmk8350-rtc";
+			reg = <0x6100>, <0x6200>;
+			reg-names = "rtc", "alarm";
+			interrupts = <0x6 0x62 0x1 IRQ_TYPE_EDGE_RISING>;
+		};
+	};
+};
+
+/*
  * Book Cover Keyboard (EF-DT970, EF-DT730 Slim) on the pogo connector: its STM32 MCU at 0x2a on QUP SE10
  * (stock qupv3_se10_i2c; gpio4/5 = mainline i2c10). Stock node: fragment@93 stm32@2a (board-id 05 overlay).
  * As live stock (/proc/device-tree, T736BXXS9DYF1, 2026-11-18): 400 kHz (qcom,clk-freq-out 0x61a80), and a sleep pin
