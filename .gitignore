@@ -196,3 +196,14 @@ sphinx_*/
 
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc
+
+# Proprietary vendor firmware and drivers pulled from a stock device (touch firmware and the like).
+# Never commit or publish these, and never an image that contains them.
+/proprietary/
+/firmware-proprietary/
+tsp_focaltech/
+tsp_himax/
+tsp_slsi/
+ft8203*.bin
+ft8203*.fw
+LOCAL-ONLY-*
