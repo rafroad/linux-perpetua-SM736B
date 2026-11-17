@@ -15,6 +15,8 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 
 #include "sm7225.dtsi"
+/* PMIC: power key (wake from screen-off), temperature alarm, GPIO controller; as the Fairphone 4. */
+#include "pm6350.dtsi"
 
 / {
 	model = "Samsung Galaxy Tab S7 FE 5G";
@@ -99,6 +101,18 @@
 			regulator-max-microvolt = <880000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
+
+		/*
+		 * DSI controller 1.2 V: pm6350_l22, window 1.08-1.305 V (lagoon-regulators.dtsi
+		 * L454-460); Samsung's dsi_ctrl0 asks for exactly 1.2 V (lagoon-sde.dtsi L356,
+		 * ctrl-supply-entry vdda-1p2 L373-375). The Fairphone 4 uses the same rail.
+		 */
+		vreg_l22a: ldo22 {
+			regulator-name = "vreg_l22a";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
 	};
 };
 
@@ -144,6 +158,16 @@
 
 &i2c7 {
 	status = "okay";
+
+	/*
+	 * SM5714 fuel gauge, 7-bit 0x71 (Samsung's 8-bit 0xE2, sm5714-private.h; live client of stock). Read only:
+	 * battery percentage, voltage, current, temperature, and the charging status of the charger block at 0x49.
+	 * No charger or gauge setting is written; charging keeps the chip's power-on behaviour (record/charging-design.md, 0b).
+	 */
+	fuel-gauge@71 {
+		compatible = "siliconmitus,sm5714-fuel-gauge";
+		reg = <0x71>;
+	};
 };
 
 /*
@@ -219,4 +243,141 @@
 			spi-max-frequency = <6000000>;
 		};
 	};
+};
+
+/*
+ * GPU: Adreno 619, in the same msm DRM device as the display (the earlier msm.separate_gpu_kms=1 split them while
+ * simpledrm showed the screen). One device lets buffers stay in the GPU's compressed tiled layout (UBWC) up to scanout;
+ * across two devices they had to be linear, which made landscape (90/270 degree) rendering about six times slower.
+ * - gpu@3d00000, gmu@3d6a000, adreno_smmu@3d40000 and gpucc@3d90000 are described in sm6350.dtsi (the last three are
+ *   enabled by default); mainline matches the chip 0x06010900 and asks for a630_sqe.fw, a619_gmu.bin and the zap shader.
+ * - The zap shader (a615_zap.mdt + .b00/.b01/.b02, from the device's own firmware) is loaded into a reserved region
+ *   and authenticated by the secure world. sm6350.dtsi places that region where Fairphone's firmware wants it
+ *   (0xf0d00000); Samsung's map puts it at 0x8b715400, size 0x2000, right after the IPA regions:
+ *   arch/arm64/boot/dts/vendor/qcom/lagoon.dtsi L416-420 (pil_gpu_mem / gpu_region@8b715400) and the rev7 tree L26548.
+ *   That range does not overlap any other reserved region of sm6350.dtsi (pil_ipa_gsi_mem ends at 0x8b715400).
+ */
+/delete-node/ &pil_gpu_mem;
+
+&reserved_memory {
+	/*
+	 * The zap image is relocatable, so the loader tells the secure world where it sits (qcom_pas_mem_setup) with the
+	 * start of this node. A first test with the whole Samsung range, whose start 0x8b715400 is not page aligned, got
+	 * -EINVAL from exactly that call (the signed metadata had been accepted just before). Samsung's own driver
+	 * allocates a page-aligned chunk inside its region; the first one is 0x8b716000. The zap node is that page, size
+	 * 0x1000 (qcom_mdt_get_size of a615_zap.mdt is 0x1000). The rest of Samsung's range stays reserved, in whole pages
+	 * (head 0x8b715400-0x8b716000 after pil_ipa_gsi_mem, tail 0x8b717000-0x8b718000 including 0xc00 of padding), so
+	 * no reservation overlaps another and no page is left half mapped.
+	 */
+	pil_gpu_head: memory@8b715400 {
+		reg = <0x0 0x8b715400 0x0 0xc00>;
+		no-map;
+	};
+
+	pil_gpu_mem: memory@8b716000 {
+		reg = <0x0 0x8b716000 0x0 0x1000>;
+		no-map;
+	};
+
+	pil_gpu_tail: memory@8b717000 {
+		reg = <0x0 0x8b717000 0x0 0x1000>;
+		no-map;
+	};
+};
+
+/*
+ * Stage 2 of the GPU bring-up: the GPU is enabled (stage 1 had the region and the firmware name only). The zap shader is
+ * not loaded at boot: the msm driver loads the firmware and the zap on the first open of the render node.
+ */
+&gpu {
+	status = "okay";
+};
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sm7225/gts7xllite/a615_zap.mdt";
+};
+
+/*
+ * Display: BOE TS124QDM on DSI0 (FocalTech FT8203, video mode, DSC), from Samsung's rev7 tree
+ * (gts7xllite_eur_openx_w00_r05.dts, ss_dsi_panel_FT8203_TS124QDM_WQXGA, qcom,dsi-ctrl-num 0 /
+ * qcom,dsi-phy-num 0). Ours: the reset line and the 5 V backlight boost. The other panel rails
+ * (pm6350_l14 1.9 V VDDI; gpio88/89 enables of the ISL98608 +-5.6 V buck, which Samsung reprograms
+ * over I2C after each power-on) are NOT described: Linux never touches them. No LP8558 on this board
+ * (compatible lp8558,display_backlight is absent from the rev7 tree).
+ * - Backlight boost: MAX77816 at 0x18 on qupv3_se8_i2c = i2c@988000 (r05 fragment@76 display_boost@18
+ *   -> __fixups__ qupv3_se8_i2c, r05 L10770; lagoon-qupv3.dtsi L273-291). Bus pins gpio19/20 qup12,
+ *   2 mA, pull-up (lagoon-pinctrl.dtsi L495-507) = mainline qup_i2c8_default. Enable: Samsung's
+ *   panel_boost_en fixed regulator, gpio72 active high (r05 L382-391), pin state ldo_gpio5: gpio,
+ *   bias-disable, output-high (r05 L6652-6664). VOUT 0x04 = 0x78 = 5.00 V after each enable
+ *   (ss_boost_control; datasheet VOUT table, reset value 0x23 = 3.30 V). The Wacom w90xx (0x56)
+ *   shares this bus and has no node.
+ * - Reset: Samsung's panel_reset fixed regulator, gpio73, enable-active-high (r05 L413-421),
+ *   pin state ldo_gpio4: function gpio, bias-disable, output-high (r05 L6719-6731). Low = reset.
+ * - The DSI PHY's 0.9 V comes from the S5A level rail downstream (lagoon-sde.dtsi L403, vdda-0p9),
+ *   not from an LDO; vdds-supply is left out (a dummy regulator) so no rail is switched for it.
+ * The simple-framebuffer stays as the fallback: msm removes it when it takes over the display.
+ */
+&tlmm {
+	backlight_boost_en: backlight-boost-en-state {
+		pins = "gpio72";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	panel_reset_default: panel-reset-default-state {
+		pins = "gpio73";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&i2c8 {
+	status = "okay";
+
+	backlight_boost: regulator@18 {
+		compatible = "maxim,max77816";
+		reg = <0x18>;
+		enable-gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&backlight_boost_en>;
+		pinctrl-names = "default";
+		regulator-name = "backlight_boost";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+	};
+};
+
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	vdda-supply = <&vreg_l22a>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "boe,ts124qdm";
+		reg = <0>;
+
+		reset-gpios = <&tlmm 73 GPIO_ACTIVE_LOW>;
+		boost-supply = <&backlight_boost>;
+		pinctrl-0 = <&panel_reset_default>;
+		pinctrl-names = "default";
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&panel_in>;
+};
+
+&mdss_dsi0_phy {
+	status = "okay";
 };

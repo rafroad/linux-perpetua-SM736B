@@ -471,6 +471,15 @@ config AXP288_FUEL_GAUGE
 	  monitoring as well as alerts for battery over/under voltage and
 	  over/under temperature.
 
+config BATTERY_SM5714
+	tristate "Silicon Mitus SM5714 fuel gauge (read only)"
+	depends on I2C
+	help
+	  Say Y to read the battery state of charge, voltage, current and
+	  charging status from the Silicon Mitus SM5714 fuel gauge, as in
+	  the Samsung Galaxy Tab S7 FE. The driver writes no gauge or charger
+	  setting; it relies on the battery model the vendor firmware loaded.
+
 config BATTERY_MAX17040
 	tristate "Maxim MAX17040/17041/17043 family Fuel Gauge"
 	depends on I2C && IIO
