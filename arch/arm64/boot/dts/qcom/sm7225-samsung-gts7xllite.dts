@@ -104,6 +104,8 @@
 
 /* Debug channel: a USB 2.0 serial gadget. No SuperSpeed PHY, no Type-C controller yet. */
 &usb_1 {
+	/* No SS PHY: the controller would wait forever on a PIPE clock; DEPCFG times out without this. */
+	qcom,select-utmi-as-pipe-clk;
 	status = "okay";
 };
 
