@@ -433,6 +433,8 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
 	}
 
 skip_status:
+	if (ret)
+		dev_err(dwc->dev, "dwc3-diag: %s ep cmd %08x failed %d status %d\n", dep->name, cmd, ret, cmd_status);
 	trace_dwc3_gadget_ep_cmd(dep, cmd, params, cmd_status);
 
 	if (DWC3_DEPCMD_CMD(cmd) == DWC3_DEPCMD_STARTTRANSFER) {
@@ -924,17 +926,24 @@ static int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
 
 	if (!(dep->flags & DWC3_EP_ENABLED)) {
 		ret = dwc3_gadget_resize_tx_fifos(dep);
-		if (ret)
+		if (ret) {
+			dev_err(dwc->dev, "dwc3-diag: %s tx fifo resize failed %d\n", dep->name, ret);
 			return ret;
+		}
 	}
 
 	ret = dwc3_gadget_set_ep_config(dep, action);
-	if (ret)
+	if (ret) {
+		dev_err(dwc->dev, "dwc3-diag: %s DEPCFG failed %d GCTL %08x DSTS %08x U2CFG %08x\n", dep->name, ret,
+			dwc3_readl(dwc, DWC3_GCTL), dwc3_readl(dwc, DWC3_DSTS), dwc3_readl(dwc, DWC3_GUSB2PHYCFG(0)));
 		return ret;
+	}
 
 	ret = dwc3_gadget_set_xfer_resource(dep);
-	if (ret)
+	if (ret) {
+		dev_err(dwc->dev, "dwc3-diag: %s DEPXFERCFG failed %d\n", dep->name, ret);
 		return ret;
+	}
 
 	if (!(dep->flags & DWC3_EP_ENABLED)) {
 		struct dwc3_trb	*trb_st_hw;
