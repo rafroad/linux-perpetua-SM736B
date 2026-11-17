@@ -159,6 +159,31 @@
 			regulator-max-microvolt = <3000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
+
+		/*
+		 * microSD I/O: pm6150l_l6, window 1.7-3.544 V (lagoon-regulators.dtsi
+		 * L634). Samsung's sdhc_2 switches it between 1.8 V (UHS) and 2.96 V
+		 * (qcom,vdd-io-voltage-level); stock runs 1.8 V.
+		 * Approved by Rafan 2026-11-17.
+		 */
+		vreg_l6e: ldo6 {
+			regulator-name = "vreg_l6e";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <2960000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * microSD card power: pm6150l_l9, window 2.7-3.544 V (L691). Samsung's
+		 * sdhc_2 asks exactly 2.96 V (qcom,vdd-voltage-level); stock runs
+		 * 2.96 V. Approved by Rafan 2026-11-17.
+		 */
+		vreg_l9e: ldo9 {
+			regulator-name = "vreg_l9e";
+			regulator-min-microvolt = <2960000>;
+			regulator-max-microvolt = <2960000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
 	};
 };
 
@@ -347,6 +372,40 @@
 /* The modem DSP: Wi-Fi's firmware service (WLFW) runs there. Calls and data are not set up. */
 &mpss {
 	firmware-name = "qcom/sm7225/gts7xllite/modem.mdt";
+	status = "okay";
+};
+
+/*
+ * microSD slot (sdhc_2). Rails above (L9E card power, L6E I/O). Card detect
+ * gpio94, active low, as Samsung's tree: pull-up while on, no pull while off,
+ * 2 mA (lagoon-pinctrl.dtsi L862-886). The clock/command/data pin states of
+ * sm6350.dtsi already equal Samsung's (16/10/10 mA, L814-850).
+ * The internal UFS stays disabled.
+ */
+&sdc2_off_state {
+	sd-cd-pins {
+		pins = "gpio94";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&sdc2_on_state {
+	sd-cd-pins {
+		pins = "gpio94";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};
+
+&sdhc_2 {
+	vmmc-supply = <&vreg_l9e>;
+	vqmmc-supply = <&vreg_l6e>;
+
+	cd-gpios = <&tlmm 94 GPIO_ACTIVE_LOW>;
+
 	status = "okay";
 };
 
