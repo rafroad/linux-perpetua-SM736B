@@ -145,3 +145,78 @@
 &i2c7 {
 	status = "okay";
 };
+
+/*
+ * Touch bus, read-only identification first. QUP wrapper 1 engine 0 (0x980000) is an SPI
+ * controller on this tablet (stock qupv3_se6_spi, rev7 tree L18062, Samsung lagoon-qupv3.dtsi L215);
+ * sm6350.dtsi describes the same engine as i2c6, so that node is replaced.
+ * Pins gpio13-15 function qup10, 6 mA, no pull: Samsung lagoon-pinctrl.dtsi L615-629
+ * (qupv3_se6_spi_active). Chip select gpio16 as a plain GPIO, output high (idle), as in the
+ * rev7 tree (cs-gpios = <&tlmm 16>, pinctrl state gpio16 output-high). The stock tree lists
+ * gpio16 twice, once per touch driver (himax cs0, focaltech cs1): one chip, one select line.
+ * The child has no kernel driver yet: bind spidev to it from init (driver_override).
+ * 6 MHz is the focaltech node's spi-max-frequency (rev7 tree L18136).
+ */
+/delete-node/ &i2c6;
+
+&tlmm {
+	qup_spi6_data_clk: qup-spi6-data-clk-state {
+		pins = "gpio13", "gpio14", "gpio15";
+		function = "qup10";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	/*
+	 * Touch chip reset, step A: a pull-up only, nothing is driven. The bootloader leaves gpio18 as an
+	 * input with a pull-down, which is Samsung's own sleep state (ft820x_tsp_rst_sleep, rev7 tree
+	 * L13048): the chip is held in reset and does not answer on SPI. This state is Samsung's active
+	 * one (ft820x_tsp_rst_active, L13032): input, pull-up, 8 mA. Low = reset, high = run
+	 * (focaltech_core.c fts_reset_proc). The line is never driven by us, neither high nor low.
+	 * Step B (drive it high, as the stock driver does at probe) only if this does not wake the chip.
+	 */
+	qup_spi6_rst: qup-spi6-rst-state {
+		pins = "gpio18";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	qup_spi6_cs: qup-spi6-cs-state {
+		pins = "gpio16";
+		function = "gpio";
+		drive-strength = <6>;
+		bias-disable;
+		output-high;
+	};
+};
+
+&qupv3_id_1 {
+	spi6: spi@980000 {
+		compatible = "qcom,geni-spi";
+		reg = <0x0 0x00980000 0x0 0x4000>;
+		clock-names = "se";
+		clocks = <&gcc GCC_QUPV3_WRAP1_S0_CLK>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&qup_spi6_data_clk>, <&qup_spi6_cs>, <&qup_spi6_rst>;
+		interrupts = <GIC_SPI 353 IRQ_TYPE_LEVEL_HIGH>;
+		dmas = <&gpi_dma1 0 0 QCOM_GPI_SPI>,
+		       <&gpi_dma1 1 0 QCOM_GPI_SPI>;
+		dma-names = "tx", "rx";
+		interconnects = <&clk_virt MASTER_QUP_CORE_1 0 &clk_virt SLAVE_QUP_CORE_1 0>,
+				<&gem_noc MASTER_AMPSS_M0 0 &config_noc SLAVE_QUP_1 0>,
+				<&aggre2_noc MASTER_QUP_1 0 &clk_virt SLAVE_EBI_CH0 0>;
+		interconnect-names = "qup-core", "qup-config", "qup-memory";
+		cs-gpios = <&tlmm 16 GPIO_ACTIVE_LOW>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		touch@0 {
+			compatible = "focaltech,ft8203-spi";
+			reg = <0>;
+			spi-max-frequency = <6000000>;
+		};
+	};
+};

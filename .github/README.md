@@ -84,6 +84,30 @@ boot it with the stock kernel, then write boot. Never change the active slot,
 and never write vbmeta, dtbo, vendor_boot or any bootloader or firmware
 partition.
 
+## Proprietary firmware
+
+Some components do not run without firmware that belongs to the vendor: modem
+and DSP images, signed GPU and Wi-Fi blobs, and the firmware of some touch
+controllers. Perpetua does not contain these files and does not publish them:
+they are proprietary and cannot be redistributed. A driver asks for its file
+through the kernel's firmware loader, so the file is looked up in
+`/lib/firmware`, and without it the component simply stays off.
+
+You take the files from the device you own, or from the source release the
+vendor publishes for it. Some vendors build the files into the stock kernel
+image, so they are not on the stock filesystem at all (the touch firmware of
+the Galaxy Tab S7 FE, `gts7xllite`, is one: Samsung's kernel source carries it
+and the stock kernel image contains it byte for byte). Copy the files to the
+firmware directory of your root filesystem under the path the driver names.
+The port of a device may carry a small script that gets them for you; it saves
+the files outside the source tree, checks them against your stock image where
+it can, and never adds them to the tree. Do not commit these files, do not
+attach them to a pull request or an issue, and do not publish an image that
+contains them.
+
+The driver code itself is free software and is carried here under its own
+licence; only the vendor's firmware files are left out.
+
 ## Adding a device
 
 A device is added in three steps: import only what this tree is missing for
