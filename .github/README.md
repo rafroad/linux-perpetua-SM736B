@@ -1,7 +1,5 @@
 # linux-perpetua
 
-# **WARNING THIS KERNEL PORT IS MOSTLY WRITTEN BY AI USE AND FLASH AT YOUR OWN RISK**
-
 Perpetua is mainline Linux for phones and tablets that ship with an Android
 bootloader. It follows the latest Linux release and carries what a small set
 of devices needs to run it: their device trees, the drivers of their

@@ -13,10 +13,12 @@
  * sm5714_charger.c (Galaxy Tab S7 FE kernel source).
  */
 
+#include <linux/devm-helpers.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/power_supply.h>
+#include <linux/workqueue.h>
 
 #define SM5714_FG_SYSTEM_STATUS		0x10
 #define SM5714_FG_INIT_DONE		BIT(12)	/* clear: the gauge lost its battery model */
@@ -41,10 +43,17 @@
 #define SM5714_CHG_CHARGING		BIT(3)
 #define SM5714_CHG_TOPOFF		BIT(5)
 
+/* The charger's interrupt registers clear on read and are left alone: plug events come from polling STATUS1. */
+#define SM5714_CHG_POLL			msecs_to_jiffies(2000)
+
 struct sm5714_fg {
 	struct i2c_client *client;
 	struct i2c_client *chg;
 	struct mutex lock;	/* the SRAM address and data reads are one transaction */
+	struct power_supply *bat;
+	struct power_supply *usb;
+	struct delayed_work poll;
+	int online;
 };
 
 static int sm5714_fg_sram(struct sm5714_fg *fg, u8 addr)
@@ -133,6 +142,13 @@ static int sm5714_fg_get_property(struct power_supply *psy,
 		val->intval = raw & SM5714_CHG_VBUS_OVP ? POWER_SUPPLY_HEALTH_OVERVOLTAGE
 						       : POWER_SUPPLY_HEALTH_GOOD;
 		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+		raw = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_STATUS2);
+		if (raw < 0)
+			return raw;
+		val->intval = raw & SM5714_CHG_CHARGING ? POWER_SUPPLY_CHARGE_TYPE_FAST
+							: POWER_SUPPLY_CHARGE_TYPE_NONE;
+		return 0;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
 		return 0;
@@ -175,6 +191,7 @@ static const enum power_supply_property sm5714_fg_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
@@ -191,9 +208,54 @@ static const struct power_supply_desc sm5714_fg_desc = {
 	.get_property = sm5714_fg_get_property,
 };
 
+/* The charger input: online while VBUS is good (STATUS1 VBUS_POK). */
+static int sm5714_usb_get_property(struct power_supply *psy,
+				   enum power_supply_property psp,
+				   union power_supply_propval *val)
+{
+	struct sm5714_fg *fg = power_supply_get_drvdata(psy);
+	int raw;
+
+	if (psp != POWER_SUPPLY_PROP_ONLINE)
+		return -EINVAL;
+	raw = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_STATUS1);
+	if (raw < 0)
+		return raw;
+	val->intval = !!(raw & SM5714_CHG_VBUS_POK);
+	return 0;
+}
+
+static const enum power_supply_property sm5714_usb_props[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+};
+
+static const struct power_supply_desc sm5714_usb_desc = {
+	.name = "usb",
+	.type = POWER_SUPPLY_TYPE_USB,
+	.properties = sm5714_usb_props,
+	.num_properties = ARRAY_SIZE(sm5714_usb_props),
+	.get_property = sm5714_usb_get_property,
+};
+
+static void sm5714_fg_poll(struct work_struct *work)
+{
+	struct sm5714_fg *fg = container_of(work, struct sm5714_fg, poll.work);
+	int raw = i2c_smbus_read_byte_data(fg->chg, SM5714_CHG_STATUS1);
+
+	if (raw >= 0 && !!(raw & SM5714_CHG_VBUS_POK) != fg->online) {
+		fg->online = !!(raw & SM5714_CHG_VBUS_POK);
+		power_supply_changed(fg->usb);
+		power_supply_changed(fg->bat);
+	}
+	schedule_delayed_work(&fg->poll, SM5714_CHG_POLL);
+}
+
+static char *sm5714_usb_supplied_to[] = { "battery" };
+
 static int sm5714_fg_probe(struct i2c_client *client)
 {
 	struct power_supply_config cfg = { .fwnode = dev_fwnode(&client->dev) };
+	struct power_supply_config usb_cfg = { };
 	struct device *dev = &client->dev;
 	struct power_supply *psy;
 	struct sm5714_fg *fg;
@@ -222,6 +284,20 @@ static int sm5714_fg_probe(struct i2c_client *client)
 	psy = devm_power_supply_register(dev, &sm5714_fg_desc, &cfg);
 	if (IS_ERR(psy))
 		return dev_err_probe(dev, PTR_ERR(psy), "failed to register battery\n");
+	fg->bat = psy;
+
+	usb_cfg.drv_data = fg;
+	usb_cfg.supplied_to = sm5714_usb_supplied_to;
+	usb_cfg.num_supplicants = ARRAY_SIZE(sm5714_usb_supplied_to);
+	fg->usb = devm_power_supply_register(dev, &sm5714_usb_desc, &usb_cfg);
+	if (IS_ERR(fg->usb))
+		return dev_err_probe(dev, PTR_ERR(fg->usb), "failed to register usb\n");
+
+	fg->online = -1;	/* the first poll announces the state */
+	ret = devm_delayed_work_autocancel(dev, &fg->poll, sm5714_fg_poll);
+	if (ret)
+		return ret;
+	schedule_delayed_work(&fg->poll, 0);
 
 	return 0;
 }

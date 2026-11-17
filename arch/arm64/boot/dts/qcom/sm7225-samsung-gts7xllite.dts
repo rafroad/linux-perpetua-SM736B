@@ -12,6 +12,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/firmware/qcom,scm.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 
 #include "sm7225.dtsi"
@@ -111,6 +112,51 @@
 			regulator-name = "vreg_l22a";
 			regulator-min-microvolt = <1200000>;
 			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * Wi-Fi rails (record/wifi-power.md). Supplies from Samsung's icnss node (lagoon.dtsi L3235-3239), windows
+		 * from lagoon-regulators.dtsi, each pinned to the voltage measured on stock with Wi-Fi on (approved by
+		 * Rafan 2026-11-17). Wi-Fi cx-mx: pm6350_l4, window 352-801 mV (L135), stock 352 mV.
+		 */
+		vreg_l4a: ldo4 {
+			regulator-name = "vreg_l4a";
+			regulator-min-microvolt = <352000>;
+			regulator-max-microvolt = <352000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* Wi-Fi 1.8 V XO: pm6350_l7, window 1.62-1.98 V (L192), stock 1.8 V, shared (2 users on stock). */
+		vreg_l7a: ldo7 {
+			regulator-name = "vreg_l7a";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	/* PM6150L (pmic e; "pm6150a" on stock). Wi-Fi rails only. */
+	regulators-1 {
+		compatible = "qcom,pm6150l-rpmh-regulators";
+		qcom,pmic-id = "e";
+
+		/* Wi-Fi 1.3 V RF: pm6150l_l2, window 1.17-1.305 V (L558), stock 1.304 V, shared (2 users on stock). */
+		vreg_l2e: ldo2 {
+			regulator-name = "vreg_l2e";
+			regulator-min-microvolt = <1304000>;
+			regulator-max-microvolt = <1304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * Wi-Fi 3.3 V chain 0: pm6150l_l10, window 3.0-3.401 V (L710), stock 3.0 V. Chain 1 (pm6150l_l11) stays
+		 * off on stock even with Wi-Fi on, so it is not declared and ath10k gets a dummy for vdd-3.3-ch1.
+		 */
+		vreg_l10e: ldo10 {
+			regulator-name = "vreg_l10e";
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 	};
@@ -283,6 +329,34 @@
 		reg = <0x0 0x8b717000 0x0 0x1000>;
 		no-map;
 	};
+
+	/*
+	 * The modem's remote file system buffer (rmtfs). Samsung allocates it dynamically (qcom,sharedmem-uio, size
+	 * 0x280000); on the running stock system it sits at 0xf9201000 (uio map0), where the modem expects it.
+	 */
+	rmtfs_mem: memory@f9201000 {
+		compatible = "qcom,rmtfs-mem";
+		reg = <0x0 0xf9201000 0x0 0x280000>;
+		no-map;
+
+		qcom,client-id = <1>;
+		qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
+	};
+};
+
+/* The modem DSP: Wi-Fi's firmware service (WLFW) runs there. Calls and data are not set up. */
+&mpss {
+	firmware-name = "qcom/sm7225/gts7xllite/modem.mdt";
+	status = "okay";
+};
+
+/* Wi-Fi: WCN3990-family over SNOC (ath10k). Rails above; record/wifi-power.md. */
+&wifi {
+	vdd-0.8-cx-mx-supply = <&vreg_l4a>;
+	vdd-1.8-xo-supply = <&vreg_l7a>;
+	vdd-1.3-rfa-supply = <&vreg_l2e>;
+	vdd-3.3-ch0-supply = <&vreg_l10e>;
+	status = "okay";
 };
 
 /*
