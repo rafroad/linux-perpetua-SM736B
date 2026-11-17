@@ -127,6 +127,21 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
+		/*
+		 * Book Cover Keyboard power over the pogo pins (stm32_vddo-supply): pm6350_l6, window 1.71-3.544 V
+		 * (lagoon-regulators.dtsi L165-181), pinned to 3.3 V by the gts7xllite overlay (fragment@47), HPM only
+		 * (fragment@95/96, levels.h mode 4). The keyboard is its only consumer (stock's other, a synaptics node, is
+		 * disabled); the driver turns it on while the connect line (gpio8) is high. 3.304 V, approved by Rafan
+		 * 2026-11-18: mainline's pldo grid is 1.504 V + n x 8 mV, so 3.3 V has no selector and fails the whole block
+		 * (boot-test36 bootlooped); 3.304 V is the nearest step at or above stock's request.
+		 */
+		vreg_l6a: ldo6 {
+			regulator-name = "vreg_l6a";
+			regulator-min-microvolt = <3304000>;
+			regulator-max-microvolt = <3304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
 		/* Wi-Fi 1.8 V XO: pm6350_l7, window 1.62-1.98 V (L192), stock 1.8 V, shared (2 users on stock). */
 		vreg_l7a: ldo7 {
 			regulator-name = "vreg_l7a";
@@ -462,6 +477,115 @@
 		pins = "gpio73";
 		function = "gpio";
 		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+/*
+ * Book Cover Keyboard (EF-DT970, EF-DT730 Slim) on the pogo connector: its STM32 MCU at 0x2a on QUP SE10
+ * (stock qupv3_se10_i2c; gpio4/5 = mainline i2c10). Stock node: fragment@93 stm32@2a (board-id 05 overlay).
+ * As live stock (/proc/device-tree, T736BXXS9DYF1, 2026-11-18): 400 kHz (qcom,clk-freq-out 0x61a80), and a sleep pin
+ * state with no bias that the controller takes whenever it is runtime-suspended, i.e. nearly always. Without it the
+ * SoC's pull-ups stay on SDA/SCL and back-feed the keyboard: its connect line pulsed even with vdd off (boot-test38).
+ * gpio9 interrupt, level low (irq_type 0x2008); gpio8 connect, high while a cover is attached; gpio10 MCU reset,
+ * idle high; gpio47 the MCU's SWD clock, held low. Keymaps from stock pogo_kpd (linux,keymap1 and 2, 8 x 24).
+ */
+&i2c10 {
+	clock-frequency = <400000>;
+	pinctrl-0 = <&qup_i2c10_default>;
+	pinctrl-1 = <&pogo_i2c_sleep>;
+	pinctrl-names = "default", "sleep";
+	status = "okay";
+
+	keyboard@2a {
+		compatible = "samsung,pogo-keyboard";
+		reg = <0x2a>;
+		interrupts-extended = <&tlmm 9 IRQ_TYPE_LEVEL_LOW>;
+		connect-gpios = <&tlmm 8 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 10 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vreg_l6a>;
+		pinctrl-0 = <&pogo_int>, <&pogo_conn>, <&pogo_nrst>, <&pogo_swclk>;
+		pinctrl-names = "default";
+		linux,keymap = <
+			0x0004002c 0x00050056 0x0007002f 0x00080032 0x0009006c 0x000b0039
+			0x000c0067 0x00100001 0x00110072 0x001602c2 0x010201d0 0x0103007d
+			0x0104001e 0x0105002d 0x01060020 0x01070030 0x01090033 0x010a0034
+			0x010b0035 0x011002c1 0x01110073 0x01160066 0x0202007a 0x02040010
+			0x0206002e 0x02070021 0x02080024 0x02090025 0x020a0026 0x020b0027
+			0x020d001c 0x021000fe 0x021100a5 0x02160068 0x03020038 0x0304000f
+			0x03050011 0x03060012 0x03070022 0x03080023 0x03090017 0x030a0028
+			0x030b0019 0x031000ac 0x031100a4 0x0316006d 0x0400003a 0x04010064
+			0x04040002 0x04050003 0x04060004 0x04070013 0x04080016 0x04090009
+			0x040a0018 0x040b000b 0x040f002b 0x041000e0 0x041100a3 0x0416006b
+			0x0501001d 0x0503006a 0x05040029 0x0505003e 0x05060041 0x05070014
+			0x05080015 0x05090044 0x050a001a 0x050b000e 0x050d000c 0x050f001b
+			0x051000e1 0x051102c5 0x051502bd 0x051602cb 0x06000036 0x06010069
+			0x0604003b 0x0605003d 0x06060040 0x06070005 0x06080008 0x06090043
+			0x060a000a 0x060b0058 0x060c0031 0x0610007d 0x0611006f 0x061602ca
+			0x0700002a 0x070102c6 0x0703001f 0x07040001 0x0705003c 0x0706003f
+			0x07070006 0x07080007 0x07090042 0x070a000d 0x070b0057 0x070d0063
+			0x070e006f 0x07100071 0x07110214 0x07120213>;
+		samsung,keymap-slim = <
+			0x0004002c 0x00050056 0x0007002f 0x00080032 0x0009006c 0x000b0039
+			0x000c0067 0x00100001 0x00110072 0x001602c2 0x010201d0 0x0103007d
+			0x0104001e 0x0105002d 0x01060020 0x01070030 0x01090033 0x010a0034
+			0x010b0035 0x011002c1 0x01110073 0x01160066 0x0202007a 0x02040010
+			0x0206002e 0x02070021 0x02080024 0x02090025 0x020a0026 0x020b0027
+			0x020d001c 0x021000fe 0x021100a5 0x02160068 0x03020038 0x0304000f
+			0x03050011 0x03060012 0x03070022 0x03080023 0x03090017 0x030a0028
+			0x030b0019 0x031000ac 0x031100a4 0x0316006d 0x0400003a 0x04010064
+			0x04040002 0x04050003 0x04060004 0x04070013 0x04080016 0x04090009
+			0x040a0018 0x040b000b 0x040f002b 0x041000e0 0x041100a3 0x0416006b
+			0x0501001d 0x0503006a 0x05040029 0x0505003e 0x05060041 0x05070014
+			0x05080015 0x05090044 0x050a001a 0x050b000e 0x050d000c 0x050f001b
+			0x051000e1 0x051102c5 0x051502bd 0x051602cb 0x06000036 0x06010069
+			0x0604003b 0x0605003d 0x06060040 0x06070005 0x06080008 0x06090043
+			0x060a000a 0x060b0058 0x060c0031 0x0610007d 0x0611006f 0x061602ca
+			0x0700002a 0x070102c6 0x0703001f 0x07040001 0x0705003c 0x0706003f
+			0x07070006 0x07080007 0x07090042 0x070a000d 0x070b0057 0x070d0063
+			0x070e006f 0x07100071 0x071102c9>;
+	};
+};
+
+&tlmm {
+	/* Stock qupv3_se10_i2c_sleep (lagoon-pinctrl.dtsi L537-548): plain GPIO, 2 mA, no bias */
+	pogo_i2c_sleep: pogo-i2c-sleep-state {
+		pins = "gpio4", "gpio5";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	/* Stock fragment@89-92: 2 mA, no pull; inputs for the interrupt and connect lines */
+	pogo_int: pogo-int-state {
+		pins = "gpio9";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
+	};
+
+	pogo_conn: pogo-conn-state {
+		pins = "gpio8";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
+	};
+
+	pogo_nrst: pogo-nrst-state {
+		pins = "gpio10";
+		function = "gpio";
+		drive-strength = <2>;
+		output-high;
+		bias-disable;
+	};
+
+	pogo_swclk: pogo-swclk-state {
+		pins = "gpio47";
+		function = "gpio";
+		drive-strength = <2>;
+		output-low;
 		bias-disable;
 	};
 };
