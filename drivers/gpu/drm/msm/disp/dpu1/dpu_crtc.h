@@ -210,7 +210,7 @@ struct dpu_crtc_state {
 
 	bool bw_control;
 	bool bw_split_vote;
-	struct drm_rect lm_bounds[CRTC_DUAL_MIXERS];
+	struct drm_rect lm_bounds[CRTC_QUAD_MIXERS];
 
 	uint64_t input_fence_timeout_ns;
 
@@ -218,10 +218,10 @@ struct dpu_crtc_state {
 
 	/* HW Resources reserved for the crtc */
 	u32 num_mixers;
-	struct dpu_crtc_mixer mixers[CRTC_DUAL_MIXERS];
+	struct dpu_crtc_mixer mixers[CRTC_QUAD_MIXERS];
 
 	u32 num_ctls;
-	struct dpu_hw_ctl *hw_ctls[CRTC_DUAL_MIXERS];
+	struct dpu_hw_ctl *hw_ctls[CRTC_QUAD_MIXERS];
 
 	enum dpu_crtc_crc_source crc_source;
 	int crc_frame_skip_count;
@@ -268,5 +268,12 @@ static inline enum dpu_crtc_client_type dpu_crtc_get_client_type(
 void dpu_crtc_frame_event_cb(struct drm_crtc *crtc, u32 event);
 
 unsigned int dpu_crtc_get_num_lm(const struct drm_crtc_state *state);
+
+struct dpu_kms;
+
+bool dpu_crtc_mixers_fit(struct dpu_kms *dpu_kms,
+			 const struct drm_display_mode *mode, u32 num_lm);
+
+u32 dpu_crtc_max_mixers(struct dpu_kms *dpu_kms, u32 num_rt_intf, bool dsc);
 
 #endif /* _DPU_CRTC_H_ */

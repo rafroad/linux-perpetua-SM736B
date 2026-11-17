@@ -2151,6 +2151,11 @@ static int a6xx_gmu_pm_resume(struct msm_gpu *gpu)
 	if (ret)
 		return ret;
 
+	if (a6xx_gpu->irq_quiesced) {
+		enable_irq(gpu->irq);
+		a6xx_gpu->irq_quiesced = false;
+	}
+
 	msm_devfreq_resume(gpu);
 
 	if (adreno_is_a8xx(adreno_gpu))
@@ -2235,6 +2240,25 @@ static int a6xx_gmu_pm_suspend(struct msm_gpu *gpu)
 	msm_devfreq_suspend(gpu);
 
 	mutex_lock(&a6xx_gpu->gmu.lock);
+	if (adreno_is_a8xx(adreno_gpu)) {
+		/*
+		 * The A8xx GMU firmware only collapses to the inter-frame
+		 * idle level once the command processor is quiescent, so
+		 * stop the GPU before waiting, as kgsl does before the
+		 * GMU power off on the same silicon: disable the
+		 * interrupt (the last completion's handler would
+		 * otherwise write GPU registers while the GMU is
+		 * deciding whether the GPU is idle) and drain the CP's
+		 * memory bus traffic. Drain without latching the GX-side
+		 * halt: kgsl's gen8 slumber path only ever halts the
+		 * client and arbiter halves, and a latched GX halt holds
+		 * the GMU's own AHB writes, raising spurious fence error
+		 * interrupts on the reinit.
+		 */
+		disable_irq(gpu->irq);
+		a6xx_gpu->irq_quiesced = true;
+		adreno_gpu->funcs->bus_halt(adreno_gpu, false);
+	}
 	ret = a6xx_gmu_stop(a6xx_gpu);
 	mutex_unlock(&a6xx_gpu->gmu.lock);
 	if (ret)

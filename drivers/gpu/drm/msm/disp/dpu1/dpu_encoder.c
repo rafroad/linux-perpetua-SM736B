@@ -55,7 +55,7 @@
 #define MAX_PHYS_ENCODERS_PER_VIRTUAL \
 	(MAX_H_TILES_PER_DISPLAY * NUM_PHYS_ENCODER_TYPES)
 
-#define MAX_CHANNELS_PER_ENC 2
+#define MAX_CHANNELS_PER_ENC 4
 #define MAX_CWB_PER_ENC 2
 
 #define IDLE_SHORT_TIMEOUT	1
@@ -676,9 +676,7 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 				 const struct drm_display_mode *adj_mode)
 {
 	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
-	struct msm_drm_private *priv = dpu_enc->base.dev->dev_private;
 	struct msm_display_info *disp_info = &dpu_enc->disp_info;
-	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
 	struct drm_connector *connector;
 	struct drm_connector_state *conn_state;
 	struct drm_framebuffer *fb;
@@ -692,22 +690,12 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 
 	dsc = dpu_encoder_get_dsc_config(drm_enc);
 
-	/* We only support 2 DSC mode (with 2 LM and 1 INTF) */
-	if (dsc) {
-		/*
-		 * Use 2 DSC encoders, 2 layer mixers and 1 or 2 interfaces
-		 * when Display Stream Compression (DSC) is enabled,
-		 * and when enough DSC blocks are available.
-		 * This is power-optimal and can drive up to (including) 4k
-		 * screens.
-		 */
-		WARN(topology->num_intf > 2,
-		     "DSC topology cannot support more than 2 interfaces\n");
-		if (topology->num_intf >= 2 || dpu_kms->catalog->dsc_count >= 2)
-			topology->num_dsc = 2;
-		else
-			topology->num_dsc = 1;
-	}
+	/*
+	 * Set DSC number as 1 to mark the enabled status, will be adjusted
+	 * in dpu_crtc_get_topology()
+	 */
+	if (dsc)
+		topology->num_dsc = 1;
 
 	connector = drm_atomic_get_new_connector_for_encoder(state, drm_enc);
 	if (!connector)
@@ -1239,9 +1227,10 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 	num_dsc = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
 						drm_enc->crtc, DPU_HW_BLK_DSC,
 						hw_dsc, ARRAY_SIZE(hw_dsc));
-	for (i = 0; i < num_dsc; i++) {
-		dpu_enc->hw_dsc[i] = to_dpu_hw_dsc(hw_dsc[i]);
-		dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
+	for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
+		dpu_enc->hw_dsc[i] = i < num_dsc ? to_dpu_hw_dsc(hw_dsc[i]) : NULL;
+		if (dpu_enc->hw_dsc[i])
+			dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
 	}
 
 	dpu_enc->dsc_mask = dsc_mask;
@@ -2002,6 +1991,37 @@ dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
 	return DIV_ROUND_UP(total_pixels, dsc->slice_width);
 }
 
+/*
+ * In DSC merge mode the outputs of two encoders are multiplexed chunk by
+ * chunk into one interface, so each encoder has to buffer a whole chunk on
+ * top of its own pipeline latency before the multiplexer starts. This is the
+ * DSC 1.2 core latency model for that case, one soft slice per encoder:
+ * the sub-stream multiplexer delay for the core's 10 bpc maximum, the
+ * output buffer width and the extra chunk.
+ */
+static u32
+dpu_encoder_dsc_merge_initial_line_calc(struct drm_dsc_config *dsc)
+{
+	int bpp = dsc->bits_per_pixel >> 4;
+	int ob_data_width = 64;
+	int ssm_out_latency, obuf_latency, total_pixels;
+
+	/* four components (native 4:2:x) need two output words */
+	if (dsc->native_420 || dsc->native_422)
+		ob_data_width = 128;
+	if (dsc->native_422)
+		bpp *= 2;
+
+	/* 28 cycles pipeline latency, max_ssm_delay = 4 * 11 + 48 - 1 */
+	ssm_out_latency = 28 + 3 * (91 + 2);
+	obuf_latency = DIV_ROUND_UP(9 * ob_data_width + 48, bpp) + 1;
+	total_pixels = dsc->initial_xmit_delay + ssm_out_latency + obuf_latency +
+		       DIV_ROUND_UP(8 * dsc->slice_chunk_size, bpp);
+
+	return DIV_ROUND_UP(total_pixels, dsc->native_422 ?
+			    dsc->slice_width / 2 : dsc->slice_width);
+}
+
 static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_ctl *ctl,
 				     struct dpu_hw_dsc *hw_dsc,
 				     struct dpu_hw_pingpong *hw_pp,
@@ -2035,6 +2055,7 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 	struct dpu_hw_ctl *ctl = enc_master->hw_ctl;
 	struct dpu_hw_dsc *hw_dsc[MAX_CHANNELS_PER_ENC];
 	struct dpu_hw_pingpong *hw_pp[MAX_CHANNELS_PER_ENC];
+	struct drm_dsc_config pair_dsc;
 	int this_frame_slices;
 	int intf_ip_w, enc_ip_w;
 	int dsc_common_mode;
@@ -2068,6 +2089,20 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 
 	enc_ip_w = intf_ip_w / num_dsc;
 	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
+
+	/*
+	 * In DSC merge mode each pair of encoders works in tandem on the part
+	 * of the picture that goes to one interface, so with more than one
+	 * interface the pair is programmed with that part's width, not with the
+	 * width of the whole panel.
+	 */
+	if ((dsc_common_mode & DSC_MODE_MULTIPLEX) && dpu_enc->num_phys_encs > 1) {
+		initial_lines = dpu_encoder_dsc_merge_initial_line_calc(dsc);
+
+		pair_dsc = *dsc;
+		pair_dsc.pic_width = pic_width / dpu_enc->num_phys_encs;
+		dsc = &pair_dsc;
+	}
 
 	for (i = 0; i < num_dsc; i++)
 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
@@ -2194,8 +2229,8 @@ static void dpu_encoder_helper_reset_mixers(struct dpu_encoder_phys *phys_enc)
 {
 	int i, num_lm;
 	struct dpu_global_state *global_state;
-	struct dpu_hw_blk *hw_lm[2];
-	struct dpu_hw_mixer *hw_mixer[2];
+	struct dpu_hw_blk *hw_lm[MAX_CHANNELS_PER_ENC];
+	struct dpu_hw_mixer *hw_mixer[MAX_CHANNELS_PER_ENC];
 	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
 
 	/* reset all mixers for this encoder */
@@ -2752,7 +2787,25 @@ static void dpu_encoder_frame_done_timeout(struct timer_list *t)
 	dpu_crtc_frame_event_cb(dpu_enc->crtc, event);
 }
 
+static enum drm_mode_status dpu_encoder_mode_valid(struct drm_encoder *drm_enc,
+						   const struct drm_display_mode *mode)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	struct msm_drm_private *priv = drm_enc->dev->dev_private;
+	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
+	u32 num_lm;
+
+	num_lm = dpu_crtc_max_mixers(dpu_kms, dpu_enc->num_phys_encs,
+				     !!dpu_encoder_get_dsc_config(drm_enc));
+
+	if (!dpu_crtc_mixers_fit(dpu_kms, mode, num_lm))
+		return MODE_CLOCK_HIGH;
+
+	return MODE_OK;
+}
+
 static const struct drm_encoder_helper_funcs dpu_encoder_helper_funcs = {
+	.mode_valid = dpu_encoder_mode_valid,
 	.atomic_mode_set = dpu_encoder_virt_atomic_mode_set,
 	.atomic_disable = dpu_encoder_virt_atomic_disable,
 	.atomic_enable = dpu_encoder_virt_atomic_enable,

@@ -6,25 +6,40 @@
  */
 
 #include <linux/backlight.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 
 #include <video/mipi_display.h>
 
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_device.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_of.h>
 #include <drm/drm_panel.h>
 
 #define DSI_NUM_MIN 1
+
+/*
+ * The error flags are sampled at the stock kernel's interval. A raised flag
+ * is sampled again shortly after, and only a flag raised at both samples
+ * resets the pipe, so that a glitch on the line cannot blank a working
+ * panel. Resets that do not clear the flag stop after a few tries.
+ */
+#define ESD_CHECK_INTERVAL_MS	5000
+#define ESD_RECHECK_MS		500
+#define ESD_MAX_RESETS		3
 
 struct panel_info {
 	struct drm_panel panel;
@@ -47,6 +62,18 @@ struct panel_info {
 	 * for a double tap. Shutdown cuts the power.
 	 */
 	bool retained, shutting_down;
+
+	/*
+	 * The panel raises its error flags, one per link, when it detected
+	 * an error (electrostatic discharge, as a rule) and its picture may
+	 * be lost. The panel then needs a reset and its setup again.
+	 */
+	struct gpio_descs *error_gpios;
+	struct delayed_work esd_work;
+	struct work_struct reset_work;
+	unsigned int esd_resets;
+	bool esd_raised;
+	bool resetting;
 };
 
 struct panel_desc {
@@ -323,6 +350,236 @@ static struct panel_desc iceland_csot_desc = {
 	},
 };
 
+/*
+ * The OnePlus Pad 3 (erhai) panel, which OnePlus names XN242 P_D A0024: the
+ * same NT36536 controller with its own settings. The commands, their order
+ * and delays are those of the stock panel description of this tablet,
+ * qcom,mdss_dsi_panel_XN242_P_D_A0024_vid.
+ */
+static int erhai_xn242_init_sequence(struct panel_info *pinfo)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[0] };
+	struct drm_dsc_picture_parameter_set pps;
+
+	/* Sent to DSI0, and by qcom,sync-dual-dsi to both links. */
+	/* CMD2 page 0 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x07, 0x46);
+
+	/* CMD3 page A */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0xe0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbb, 0x00);
+
+	/* CMD2 page 4 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x24);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x98, 0x80);
+
+	/* CMD2 page 3 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x89, 0xa4);
+
+	/* CMD3 page B */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xe6, 0x02);
+
+	/* CMD2 page 7 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x27);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd0, 0x31);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd1, 0x05);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xde, 0x40);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdf, 0x02);
+
+	/* CMD1: user command set */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x10);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3b,
+				     0x03, 0xe8, 0x1a, 0x04, 0x04, 0x00, 0x80,
+				     0x36, 0x36);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x40);
+
+	/* CMD1: user command set */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x10);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0x07, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x2c);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x55, 0x00);
+
+	/* CMD2 page 3 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x00, 0x60);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x07, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x08, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x09, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x11, 0x05);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x12, 0xa0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x13, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x15, 0xea);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x16, 0x17);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x0a, 0x8e);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x0b, 0x8e);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x0c, 0x8e);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x0d, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x19, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1a, 0x04);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1b, 0x08);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1c, 0x0c);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1d, 0x10);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1e, 0x14);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1f, 0x18);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x20, 0x1c);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x21, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x22, 0x24);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x23, 0x28);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x24, 0x2c);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x25, 0x30);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x26, 0x34);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x27, 0x38);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x28, 0x3c);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2a, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2b, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x30, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x31, 0xfd);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x32, 0xfc);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x33, 0xfa);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x34, 0xf8);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x35, 0xf6);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x36, 0xf4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x37, 0xf2);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x38, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x39, 0xee);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3a, 0xec);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3b, 0xea);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3d, 0xe9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x3f, 0xe8);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x40, 0xe7);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x41, 0xe6);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x45, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x46, 0xf9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x47, 0xf6);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x48, 0xf2);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x49, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4a, 0xec);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4b, 0xe8);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4c, 0xe4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4d, 0xe0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4e, 0xde);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x4f, 0xd9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x50, 0xd6);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0xd4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x52, 0xc2);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0xd0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x54, 0xcd);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x58, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x59, 0xf6);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5a, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5b, 0xeb);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5c, 0xe8);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5d, 0xe5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5e, 0xe3);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x5f, 0xe0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0xde);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x61, 0xda);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x62, 0xd7);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x63, 0xd4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x64, 0xd2);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0xd0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x66, 0xcc);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x67, 0xc8);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6e, 0xb3);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0xd0);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x70, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x71, 0xb3);
+
+	/* CMD1: user command set */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x10);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x90, 0x03);
+	/* The controller's own compression setup, as stock sends it */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x91,
+				     0x89, 0xa8, 0x00, 0x14, 0xd2, 0x00, 0x00,
+				     0x00, 0x02, 0x38, 0x00, 0x0b, 0x05, 0x7a,
+				     0x03, 0x37);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x92, 0x10, 0xe0);
+
+	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
+	mipi_dsi_msleep(&dsi_ctx, 120);
+	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+	mipi_dsi_msleep(&dsi_ctx, 10);
+
+	/* Stock sends the picture parameter set after the display is on. */
+	drm_dsc_pps_payload_pack(&pps, &pinfo->desc->dsc);
+	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
+
+	return dsi_ctx.accum_err;
+}
+
+/*
+ * The stock timing of each link is 1696 pixels wide with 50, 32 and 64
+ * pixels of front porch, sync and back porch, doubled here for the two
+ * links. Its other refresh rates change only the porches.
+ */
+#define ERHAI_XN242_MODE(hfp, hsw, hbp, vfp, vbp, fps)				\
+	{									\
+		.clock = (3392 + (hfp) + (hsw) + (hbp)) *			\
+			 (2400 + (vfp) + 2 + (vbp)) * (fps) / 1000,		\
+		.hdisplay = 3392,						\
+		.hsync_start = 3392 + (hfp),					\
+		.hsync_end = 3392 + (hfp) + (hsw),				\
+		.htotal = 3392 + (hfp) + (hsw) + (hbp),				\
+		.vdisplay = 2400,						\
+		.vsync_start = 2400 + (vfp),					\
+		.vsync_end = 2400 + (vfp) + 2,					\
+		.vtotal = 2400 + (vfp) + 2 + (vbp),				\
+	}
+
+static const struct drm_display_mode erhai_xn242_modes[] = {
+	/* First is preferred: the bootloader runs 120 Hz, the stock default. */
+	ERHAI_XN242_MODE(100, 64, 128, 26, 230, 120),
+	ERHAI_XN242_MODE(68, 32, 40, 26, 52, 144),
+	ERHAI_XN242_MODE(420, 160, 320, 26, 52, 90),
+	ERHAI_XN242_MODE(100, 64, 128, 2684, 230, 60),
+	/* 50 and 48 Hz stretch the 90 Hz frame: its pixel clock exactly. */
+	ERHAI_XN242_MODE(420, 160, 320, 2010, 52, 50),
+	ERHAI_XN242_MODE(420, 160, 320, 2196, 52, 48),
+	ERHAI_XN242_MODE(100, 64, 128, 8000, 230, 30),
+};
+
+static struct panel_desc erhai_xn242_desc = {
+	.modes = erhai_xn242_modes,
+	.num_modes = ARRAY_SIZE(erhai_xn242_modes),
+	.dsi_info = {
+		.type = "XN242-erhai",
+		.channel = 0,
+		.node = NULL,
+	},
+	.width_mm = 274,
+	.height_mm = 193,
+	.bpc = 8,
+	.lanes = 4,
+	.format = MIPI_DSI_FMT_RGB888,
+	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |
+		      MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT,
+	.init_sequence = erhai_xn242_init_sequence,
+	.is_dual_dsi = true,
+	.dsc = {
+		.dsc_version_major = 0x1,
+		.dsc_version_minor = 0x2,
+		.slice_height = 20,
+		.slice_width = 848,
+		.slice_count = 2,
+		.bits_per_component = 8,
+		.bits_per_pixel = 8 << 4,
+		.block_pred_enable = true,
+	},
+};
+
 static void nt36536_reset(struct panel_info *pinfo)
 {
 	gpiod_set_value_cansleep(pinfo->reset_gpio, 0);
@@ -378,10 +635,112 @@ static int nt36536_prepare(struct drm_panel *panel)
 	return 0;
 }
 
+static bool nt36536_error_raised(struct panel_info *pinfo)
+{
+	struct gpio_descs *gpios = pinfo->error_gpios;
+	DECLARE_BITMAP(values, 2);
+	int ret;
+
+	ret = gpiod_get_array_value_cansleep(gpios->ndescs, gpios->desc,
+					     gpios->info, values);
+	/* A flag that cannot be read is no reason to blank the panel. */
+	if (ret)
+		return false;
+
+	return !bitmap_empty(values, gpios->ndescs);
+}
+
+/*
+ * Power-cycle the pipe feeding the panel, as drm_bridge_helper_reset_crtc()
+ * does for a bridge: the panel is disabled, reset and set up again.
+ */
+static void nt36536_reset_work(struct work_struct *work)
+{
+	struct panel_info *pinfo = container_of(work, struct panel_info,
+						reset_work);
+	struct drm_connector *connector = pinfo->connector;
+	struct drm_modeset_acquire_ctx ctx;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+retry:
+	ret = drm_modeset_lock(&connector->dev->mode_config.connection_mutex,
+			       &ctx);
+	if (!ret && connector->state && connector->state->crtc)
+		ret = drm_atomic_helper_reset_crtc(connector->state->crtc, &ctx);
+	if (ret == -EDEADLK) {
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	if (ret)
+		dev_err(pinfo->panel.dev, "failed to reset the display pipe: %d\n",
+			ret);
+
+	WRITE_ONCE(pinfo->resetting, false);
+}
+
+static void nt36536_schedule_reset(struct panel_info *pinfo)
+{
+	if (!pinfo->connector || READ_ONCE(pinfo->resetting))
+		return;
+
+	WRITE_ONCE(pinfo->resetting, true);
+	schedule_work(&pinfo->reset_work);
+}
+
+static void nt36536_esd_work(struct work_struct *work)
+{
+	struct panel_info *pinfo = container_of(to_delayed_work(work),
+						struct panel_info, esd_work);
+	unsigned int delay = ESD_CHECK_INTERVAL_MS;
+
+	if (!nt36536_error_raised(pinfo)) {
+		pinfo->esd_raised = false;
+		pinfo->esd_resets = 0;
+	} else if (!pinfo->esd_raised) {
+		pinfo->esd_raised = true;
+		delay = ESD_RECHECK_MS;
+	} else if (pinfo->esd_resets < ESD_MAX_RESETS) {
+		pinfo->esd_raised = false;
+		pinfo->esd_resets++;
+		dev_warn(pinfo->panel.dev,
+			 "error flag raised, resetting the display pipe\n");
+		/* Enabling the panel again restarts the checks. */
+		nt36536_schedule_reset(pinfo);
+		return;
+	} else if (pinfo->esd_resets == ESD_MAX_RESETS) {
+		pinfo->esd_resets++;
+		dev_err(pinfo->panel.dev,
+			"error flag still raised after %u resets, leaving the panel as it is\n",
+			ESD_MAX_RESETS);
+	}
+
+	schedule_delayed_work(&pinfo->esd_work, msecs_to_jiffies(delay));
+}
+
+static int nt36536_enable(struct drm_panel *panel)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+
+	if (pinfo->error_gpios) {
+		pinfo->esd_raised = false;
+		schedule_delayed_work(&pinfo->esd_work,
+				      msecs_to_jiffies(ESD_CHECK_INTERVAL_MS));
+	}
+
+	return 0;
+}
+
 static int nt36536_disable(struct drm_panel *panel)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[0] };
+
+	if (pinfo->error_gpios)
+		cancel_delayed_work_sync(&pinfo->esd_work);
 
 	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
 
@@ -413,6 +772,9 @@ static void nt36536_remove(struct mipi_dsi_device *dsi)
 {
 	struct panel_info *pinfo = mipi_dsi_get_drvdata(dsi);
 
+	/* A reset in flight enables the panel and restarts the checks. */
+	cancel_work_sync(&pinfo->reset_work);
+	cancel_delayed_work_sync(&pinfo->esd_work);
 	drm_panel_remove(&pinfo->panel);
 }
 
@@ -421,6 +783,9 @@ static void nt36536_shutdown(struct mipi_dsi_device *dsi)
 {
 	struct panel_info *pinfo = mipi_dsi_get_drvdata(dsi);
 
+	/* A reset in flight enables the panel and restarts the checks. */
+	cancel_work_sync(&pinfo->reset_work);
+	cancel_delayed_work_sync(&pinfo->esd_work);
 	pinfo->shutting_down = true;
 }
 
@@ -464,12 +829,39 @@ static enum drm_panel_orientation nt36536_get_orientation(struct drm_panel *pane
 	return pinfo->orientation;
 }
 
+/* Writing to "recover" resets the display pipe as a raised error flag does. */
+static ssize_t nt36536_recover_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	struct panel_info *pinfo = file->private_data;
+
+	nt36536_schedule_reset(pinfo);
+
+	return count;
+}
+
+static const struct file_operations nt36536_recover_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = nt36536_recover_write,
+	.llseek = noop_llseek,
+};
+
+static void nt36536_debugfs_init(struct drm_panel *panel, struct dentry *root)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+
+	debugfs_create_file("recover", 0200, root, pinfo, &nt36536_recover_fops);
+}
+
 static const struct drm_panel_funcs nt36536_panel_funcs = {
 	.disable = nt36536_disable,
+	.enable = nt36536_enable,
 	.prepare = nt36536_prepare,
 	.unprepare = nt36536_unprepare,
 	.get_modes = nt36536_get_modes,
 	.get_orientation = nt36536_get_orientation,
+	.debugfs_init = nt36536_debugfs_init,
 };
 
 static int nt36536_probe(struct mipi_dsi_device *dsi)
@@ -511,6 +903,16 @@ static int nt36536_probe(struct mipi_dsi_device *dsi)
 	pinfo->desc = (struct panel_desc *)of_device_get_match_data(dev);
 	if (!pinfo->desc)
 		return -ENODEV;
+
+	pinfo->error_gpios = devm_gpiod_get_array_optional(dev, "error-flag",
+							   GPIOD_IN);
+	if (IS_ERR(pinfo->error_gpios))
+		return dev_err_probe(dev, PTR_ERR(pinfo->error_gpios),
+				     "failed to get error flag gpios\n");
+	if (pinfo->error_gpios && pinfo->error_gpios->ndescs > 2)
+		return dev_err_probe(dev, -EINVAL, "too many error flag gpios\n");
+	INIT_DELAYED_WORK(&pinfo->esd_work, nt36536_esd_work);
+	INIT_WORK(&pinfo->reset_work, nt36536_reset_work);
 
 	/* If the panel is dual dsi, register DSI1 */
 	if (pinfo->desc->is_dual_dsi) {
@@ -569,6 +971,10 @@ static const struct of_device_id nt36536_of_match[] = {
 	{
 		.compatible = "oneplus,iceland-nt36536",
 		.data = &iceland_csot_desc,
+	},
+	{
+		.compatible = "oneplus,erhai-nt36536",
+		.data = &erhai_xn242_desc,
 	},
 	{},
 };
